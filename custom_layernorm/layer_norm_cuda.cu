@@ -1,51 +1,39 @@
-//A kernel that achieves:
-//
-//
-//
-//
-#include <cuda_runtime.h>  //including cuda runtime API
+#include <cuda_runtime.h>
 #include <stdio.h>
 
-#define WARP_SIZE 32  //A warp containing 32 threads
-#define EPSILON 1e-6f //a small number to avoid zero in denominator
+#define WARP_SIZE 32
+#define EPSILON 1e-6f
 
-// Warp Reduce
 __device__ float warpReduceSum(float val) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset); //warp reducing core
+        val += __shfl_down_sync(0xffffffff, val, offset);
     }
     return val;
 }
 
-// LayerNorm CUDA Kernel
-__global__ void layer_norm_kernel(float* __restrict__ output,      //__restrict__ make the ptr safe to
-                                  const float* __restrict__ input, //improve the accessment efficiency
-                                  const float* __restrict__ gamma, 
-                                  const float* __restrict__ beta, 
+__global__ void layer_norm_kernel(float* __restrict__ output,
+                                  const float* __restrict__ input,
+                                  const float* __restrict__ gamma,
+                                  const float* __restrict__ beta,
                                   int hidden_size) {
-    // get message of thread
     int tid = threadIdx.x;
     int bid = blockIdx.x;
-    int lane = tid % WARP_SIZE;  // index of thread in warp
-    int warp_id = tid / WARP_SIZE;  // thread belongs to which warp 
+    int lane = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
 
-    //Calculating the number of warps
     int num_warps = blockDim.x / WARP_SIZE;
-    int num_vec4 = hidden_size / 4;  // float4 vectorization
+    int num_vec4 = hidden_size / 4;
 
-    //shared memory
     __shared__ float buffer[2][WARP_SIZE];
 
-    //float4 vectorized access //Disposing 4 float one times
-    float4* input4  = (float4*) (input + bid * hidden_size);
+    float4* input4 = (float4*) (input + bid * hidden_size);
     float4* output4 = (float4*) (output + bid * hidden_size);
-    float4* gamma4  = (float4*) gamma;
-    float4* beta4   = (float4*) beta;
+    float4* gamma4 = (float4*) gamma;
+    float4* beta4 = (float4*) beta;
 
     float sum = 0.0f, sum_sq = 0.0f;
     float4 local_data;
 
-    //Calculate the mean and variance
     for (int i = tid; i < num_vec4; i += blockDim.x) {
         local_data = input4[i];
         float v1 = local_data.x, v2 = local_data.y;
@@ -55,18 +43,15 @@ __global__ void layer_norm_kernel(float* __restrict__ output,      //__restrict_
         sum_sq += (v1 * v1 + v2 * v2 + v3 * v3 + v4 * v4);
     }
 
-    // Warp Reduce sum
     sum = warpReduceSum(sum);
     sum_sq = warpReduceSum(sum_sq);
 
-    //Shared memory // double-buffered
     if (lane == 0) {
         buffer[0][warp_id] = sum;
         buffer[1][warp_id] = sum_sq;
     }
     __syncthreads();
 
-    //only one warp dealing with the final reduction
     if (warp_id == 0) {
         sum = (tid < num_warps) ? buffer[0][tid] : 0;
         sum_sq = (tid < num_warps) ? buffer[1][tid] : 0;
@@ -86,7 +71,6 @@ __global__ void layer_norm_kernel(float* __restrict__ output,      //__restrict_
     float mean = buffer[0][0];
     float rstd = buffer[1][0];
 
-    //Normalized calculations
     for (int i = tid; i < num_vec4; i += blockDim.x) {
         float4 g = gamma4[i];
         float4 b = beta4[i];
@@ -100,15 +84,10 @@ __global__ void layer_norm_kernel(float* __restrict__ output,      //__restrict_
     }
 }
 
-//operating Kernel
-void launch_layer_norm(float* output, const float* input, 
-                       const float* gamma, 
-                       const float* beta, int batch, 
+void launch_layer_norm(float* output, const float* input,
+                       const float* gamma, const float* beta, int batch,
                        int hidden_size) {
-     int threads = 256;  
+    int threads = 256;
     int blocks = batch;
-    layer_norm_kernel<<<blocks, threads>>>(output, 
-                                           input, 
-                                           gamma, beta, 
-                                           hidden_size);
+    layer_norm_kernel<<<blocks, threads>>>(output, input, gamma, beta, hidden_size);
 }
